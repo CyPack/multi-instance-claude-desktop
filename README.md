@@ -69,8 +69,8 @@ Initial launch:    xdotool search --sync (X event, ~300ms)
 ## Installation
 
 ```bash
-git clone https://github.com/<your-user>/multi-session-claude-desktop.git
-cd multi-session-claude-desktop
+git clone https://github.com/<your-user>/multi-instance-claude-desktop.git
+cd multi-instance-claude-desktop
 
 # 1. Install launcher
 install -Dm755 bin/claude-launch ~/.local/bin/claude-launch
