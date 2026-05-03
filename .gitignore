@@ -1,0 +1,29 @@
+# OS / editor
+.DS_Store
+*.swp
+*~
+
+# Backup / cache
+*.bak
+*.bak.*
+*.cache
+*.log
+.cache/
+
+# User-specific paths (defensive — should not be in repo anyway)
+**/Claude-*/
+**/.config/Claude*/
+config.json
+claude_desktop_config.json
+ant-did
+SingletonLock
+SingletonCookie
+SingletonSocket
+
+# Test artifacts
+/tmp/
+test-output/
+
+# IDE
+.vscode/
+.idea/

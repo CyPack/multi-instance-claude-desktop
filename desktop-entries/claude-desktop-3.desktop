@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Claude (Profile 3)
+Exec=$HOME/.local/bin/claude-launch 3 %u
+Icon=claude-desktop-3
+Type=Application
+Terminal=false
+Categories=Office;Utility;
+MimeType=x-scheme-handler/claude;
+StartupWMClass=Claude-3

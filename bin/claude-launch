@@ -1,0 +1,696 @@
+#!/usr/bin/env bash
+# claude-launch v3 — Multi-instance Claude Desktop launcher with WATCHER-based cleanup
+#
+# v1 → v2 (systemd-run scope) BOS PENCERE bug yarattıi
+# v3 = v1 base + watcher-tabanlı cleanup (scope YOK, renderer sağlam)
+#
+# Usage:
+#   claude-launch              # ana Claude (Profile 1 — direct launch)
+#   claude-launch 2|3|4|5      # belirli profil (direct launch + watcher)
+#   claude-launch all          # 1+2+3+4
+#   claude-launch status       # acik instance + watcher durumu
+#   claude-launch kill 2       # belirli profil + tum cocuklarini temizle
+#   claude-launch kill-extras  # ana haric hepsi
+#   claude-launch kill-all     # TUM profiller (1 dahil)
+#   claude-launch sweep        # orphan MCP/agent temizlik (panic recovery)
+#
+# Cleanup mekanizmasi:
+#   - Launch sirasinda electron PID yakala → ~/.cache/claude-launch/profile-N.pid
+#   - Background watcher: while kill -0 $pid; sleep 2; done; cleanup
+#   - cleanup: pkill -f user-data-dir + sweep_orphan_mcps
+#
+# Bos pencere problemi sebebi (v2 deneyimi): systemd-run --user --scope
+# electron renderer GPU/dbus context'ini bozuyor. v3 BUNU KULLANMAZ.
+
+set -euo pipefail
+
+# ============================================================
+# Sabitler
+# ============================================================
+MAIN_DIR="$HOME/.config/Claude"
+BIN="/usr/bin/claude-desktop"
+LAUNCH_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/claude-launch"
+LAUNCH_LOG="${XDG_CACHE_HOME:-$HOME/.cache}/claude-launch.log"
+
+# Bilinen MCP/agent process pattern'leri (sweep için)
+ORPHAN_PATTERNS='mcp_server\.py|@playwright/mcp|@notionhq|@eslint|/scrapling-workspace/.*mcp|/t4f-api-client|/openclaw-bridge.*mcp|claude-code/[0-9.]+/claude|/projects/.*mcp|/projects/plugin-registry|/projects/selfhosted-supabase-mcp|/projects/mega-mcp|/projects/semantic-navigator-local|office-powerpoint/ppt_mcp|siyuan-mcp|evolution_mcp|workspace-mcp|ai-quality-gate|a11y-mcp|image-compare|chrome-devtools-mcp|ccglm-mcp|dokploy-mcp|package-registry-mcp|penpot-mcp-server'
+
+mkdir -p "$LAUNCH_CACHE"
+
+# ============================================================
+# GPU / RENDERING SETTINGS — easy enable/disable for AI workload sharing
+# ============================================================
+# Kullanim: Asagidaki satirlari yorumdan cikartmak/yoruma almakla
+# Claude Desktop'in GPU kullanimini kontrol edebilirsiniz.
+# Default: Tum kaynaklari (GPU+CPU+RAM) tam kullan — hicbir flag yok.
+#
+# AI/embedding model'leri icin GPU'yu serbest birakmak isterseniz
+# yorumlardan birini acabilirsiniz:
+#
+# CLAUDE_EXTRA_FLAGS=()  # Default: bos array, tum GPU kaynaklari kullanilir
+#
+# === GPU TAMAMEN DISABLE (CPU-only software rendering, en fazla GPU serbestlik) ===
+# CLAUDE_EXTRA_FLAGS+=(--disable-gpu --disable-software-rasterizer)
+#
+# === GPU compositing kapali ama renderer'da GPU acceleration acik (orta yol) ===
+# CLAUDE_EXTRA_FLAGS+=(--disable-gpu-compositing)
+#
+# === Software OpenGL (SwiftShader — CPU OpenGL emulation) ===
+# CLAUDE_EXTRA_FLAGS+=(--use-gl=swiftshader)
+#
+# === Sandbox VRAM limiti (NVIDIA'da deneysel — VRAM cap MB) ===
+# CLAUDE_EXTRA_FLAGS+=(--gpu-memory-buffer-compositor-resources)
+#
+# === Hardware video decode kapali (VAAPI serbest — ffmpeg/AI video icin) ===
+# CLAUDE_EXTRA_FLAGS+=(--disable-accelerated-video-decode)
+#
+# === GPU enable + Wayland native (default x11/XWayland yerine) ===
+# Note: launcher-common.sh CLAUDE_USE_WAYLAND=1 env'ini de okur
+# CLAUDE_EXTRA_FLAGS+=(--ozone-platform=wayland --enable-features=UseOzonePlatform)
+#
+# CUSTOM combinations:
+# CLAUDE_EXTRA_FLAGS+=(--disable-gpu --js-flags="--max-old-space-size=2048")  # GPU kapali + RAM cap
+#
+# Default: bos array (Claude tum GPU/CPU/RAM kaynaklarini kullanir)
+CLAUDE_EXTRA_FLAGS=()
+
+# Env override (calistirma anindan etkinlestirme):
+#   CLAUDE_DISABLE_GPU=1 claude-launch 4   # tek seferlik GPU disable
+if [ "${CLAUDE_DISABLE_GPU:-0}" = "1" ]; then
+  CLAUDE_EXTRA_FLAGS+=(--disable-gpu --disable-software-rasterizer)
+fi
+if [ "${CLAUDE_USE_SOFTWARE_GL:-0}" = "1" ]; then
+  CLAUDE_EXTRA_FLAGS+=(--use-gl=swiftshader)
+fi
+
+# ============================================================
+# Logging
+# ============================================================
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LAUNCH_LOG"
+}
+
+# ============================================================
+# Profile dir helper
+# ============================================================
+profile_dir() {
+  local profile="$1"
+  if [ "$profile" = "1" ]; then
+    echo "$HOME/.config/Claude"
+  else
+    echo "$HOME/.config/Claude-$profile"
+  fi
+}
+
+# ============================================================
+# Token sync (ana profilden hedef profile, sadece eksikse)
+# ============================================================
+sync_token() {
+  local profile="$1"
+  local target_dir="$HOME/.config/Claude-$profile"
+  local target="$target_dir/config.json"
+  [ -f "$target" ] || return 0
+  [ -f "$MAIN_DIR/config.json" ] || return 0
+  command -v jq >/dev/null || return 0
+
+  local target_tc
+  target_tc=$(jq -r '."oauth:tokenCache" // empty' "$target" 2>/dev/null) || return 0
+  [ -n "$target_tc" ] && return 0
+
+  local main_tc
+  main_tc=$(jq -r '."oauth:tokenCache" // empty' "$MAIN_DIR/config.json" 2>/dev/null) || return 0
+  [ -z "$main_tc" ] && return 0
+
+  local tmp
+  tmp=$(mktemp)
+  if jq --arg tc "$main_tc" '."oauth:tokenCache" = $tc' "$target" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$target"
+    log "sync_token: copied from main → Claude-$profile"
+    echo "  (ilk kez token sync: ana → Claude-$profile)"
+  else
+    rm -f "$tmp"
+    log "sync_token: FAILED for Claude-$profile"
+  fi
+}
+
+# ============================================================
+# Profile dizin hazırlığı
+# ============================================================
+ensure_profile() {
+  local profile="$1"
+  local dir="$HOME/.config/Claude-$profile"
+
+  if [ ! -d "$dir" ]; then
+    echo "Creating profile Claude-$profile..."
+    mkdir -m 700 -p "$dir"
+    for item in claude-code claude-code-sessions git-worktrees.json local-agent-mode-sessions pending-uploads buddy-tokens.json; do
+      ln -sfn "$MAIN_DIR/$item" "$dir/$item"
+    done
+    mkdir -m 700 -p "$dir/claude-code-vm"
+    cp "$MAIN_DIR/config.json" "$dir/config.json"
+    cp "$MAIN_DIR/claude_desktop_config.json" "$dir/claude_desktop_config.json" 2>/dev/null || true
+    chmod 600 "$dir/config.json" "$dir/claude_desktop_config.json" 2>/dev/null || true
+    echo -n "$(uuidgen)" | base64 -w0 > "$dir/ant-did"
+    chmod 600 "$dir/ant-did"
+    log "ensure_profile: created Claude-$profile"
+    return 0
+  fi
+
+  # Drift repair: claude-code-vm symlink ise REAL DIR'a cevir
+  if [ -L "$dir/claude-code-vm" ]; then
+    rm "$dir/claude-code-vm"
+    mkdir -m 700 "$dir/claude-code-vm"
+    log "ensure_profile: repaired claude-code-vm symlink → real dir for Claude-$profile"
+  fi
+  # Dir izin 700
+  local cur_mode
+  cur_mode=$(stat -c%a "$dir" 2>/dev/null)
+  if [ "$cur_mode" != "700" ]; then
+    chmod 700 "$dir"
+  fi
+}
+
+# ============================================================
+# Singleton lock check (race-free re-launch detection)
+# ============================================================
+profile_already_running() {
+  local profile="$1"
+  local lock="$(profile_dir "$profile")/SingletonLock"
+  [ -L "$lock" ] || return 1
+  local target pid
+  target=$(readlink "$lock" 2>/dev/null) || return 1
+  pid="${target##*-}"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+# ============================================================
+# Cleanup wait — basitlestirildi (eski state lock + process check)
+# Race senaryosu: kullanici X tikla + hemen dock'tan ac → eski Profile
+# henuz tam olmemis. Stale SingletonLock + survivor process kalintisi
+# yeni launch'i bozar. 5s'ye kadar bekle, sonra stale lock'lari temizle.
+# ============================================================
+wait_for_cleanup() {
+  local profile="$1"
+  local dir
+  dir=$(profile_dir "$profile")
+  local i=0
+
+  # Max 5s bekle: profile process'leri tamamen olmesini bekle
+  while [ $i -lt 5 ]; do
+    local n=0
+    if [ "$profile" = "1" ]; then
+      # Profile 1: --user-data-dir flag'i OLMAYAN main electron
+      n=$(pgrep -f 'electron.*app\.asar' 2>/dev/null | while read pid; do
+        cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
+        case "$cmd" in
+          *--type=*|*--user-data-dir=*) ;;
+          *electron*app.asar*) echo "$pid" ;;
+        esac
+      done | wc -l) || true
+    else
+      n=$(pgrep -f "user-data-dir=$dir" 2>/dev/null | wc -l) || true
+    fi
+    [ "$n" = "0" ] && break
+    sleep 1
+    i=$((i + 1))
+  done
+
+  # Stale SingletonLock temizligi (launcher-common.sh da yapar ama biz de yapalim)
+  if [ -L "$dir/SingletonLock" ]; then
+    local target pid
+    target=$(readlink "$dir/SingletonLock" 2>/dev/null || echo "")
+    pid="${target##*-}"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$dir/SingletonLock" "$dir/SingletonCookie" "$dir/SingletonSocket"
+        log "wait_for_cleanup: removed stale SingletonLock (PID $pid dead) for Profile $profile"
+      fi
+    fi
+  fi
+}
+
+# ============================================================
+# Mevcut profile penceresini AC (yeni pencere request'i)
+# Strateji: Electron'un kendi single-instance lock mantigini tetikle.
+# Secondary instance launch et → primary instance "second-instance" event alir →
+# createWindow cagirir → YENI pencere acar (Profile 1 dock-click davranisinin aynisi).
+# Bu xdotool windowmap'ten cok daha guvenilir cunku X-tikladiginda destroyed
+# pencereyi raise etmeye calismaz, fresh pencere olusturur.
+# ============================================================
+raise_existing_profile() {
+  local profile="$1"
+  local dir="$(profile_dir "$profile")"
+
+  log "raise_existing_profile: Profile $profile - electron single-instance trigger"
+
+  # Profile-specific secondary launch (electron exit eder hizla, primary pencere acar)
+  if [ "$profile" = "1" ]; then
+    nohup env COWORK_VM_BACKEND=bwrap TMPDIR="$MAIN_DIR/tmp" \
+      "$BIN" "${CLAUDE_EXTRA_FLAGS[@]}" >/dev/null 2>&1 &
+  else
+    nohup env COWORK_VM_BACKEND=bwrap TMPDIR="$dir/tmp" \
+      "$BIN" --user-data-dir="$dir" --class="Claude-$profile" --name="Claude-$profile" \
+      "${CLAUDE_EXTRA_FLAGS[@]}" >/dev/null 2>&1 &
+  fi
+  disown
+
+  # YENI: raise sonrasi yeni pencere'nin WM_CLASS'ini de fix et.
+  # Sebep: Electron single-instance event ile primary YENI pencere acar,
+  # ama bu yeni pencerenin WM_CLASS'i 'claude' (lowercase) kalir →
+  # taskbar/dock yanlis ikon eslesir. fix_wm_class_persistent yeniden
+  # tetiklenmeli (kisa scan, mevcut electron PID'i izliyor).
+  if [ "$profile" != "1" ]; then
+    ( fix_wm_class_persistent "$profile" "$dir" ) >/dev/null 2>&1 &
+    disown
+  fi
+  return 0
+}
+
+# ============================================================
+# WM_CLASS fix — HYBRID (B: xdotool --sync event + A: 30s backup scan)
+# Onceki: 5s polling = ~6s glitch ("turuncu → renk")
+# Yeni: --sync event-based = ~300ms glitch + 30s backup scan
+# Kaynak: ~2.3 MB RAM (xdotool sleeping), ~0.5s CPU toplam
+# ============================================================
+fix_wm_class_persistent() {
+  local profile="$1"
+  local dir="$2"
+  command -v xdotool >/dev/null || return 0
+  local pid wid cur tries=0 fix_count=0
+  local target_class="Claude-$profile"
+
+  # PHASE 1: Electron PID bul (0.2s polling = 50 iter × 0.2s = 10s max)
+  # Eskiden 1s polling = ilk fix 1-10s gecikmeli. Simdi tipik 0.2-1s.
+  while [ $tries -lt 50 ]; do
+    pid=$(pgrep -f "electron.*--user-data-dir=$dir" 2>/dev/null | head -1) || true
+    [ -n "${pid:-}" ] && break
+    sleep 0.2
+    tries=$((tries + 1))
+  done
+  [ -z "${pid:-}" ] && { log "fix_wm_class_persistent: TIMEOUT no electron for Claude-$profile"; return 1; }
+
+  # PHASE 2 (B): xdotool --sync ile pencere event-based bekle (KERNEL idle)
+  # X server pencere create event'i geldigi an return eder (~100-300ms)
+  local first_wid
+  first_wid=$(timeout 30 xdotool search --sync --pid "$pid" 2>/dev/null | head -1) || true
+  if [ -n "$first_wid" ]; then
+    for wid in $(xdotool search --pid "$pid" 2>/dev/null); do
+      cur=$(xprop -id "$wid" WM_CLASS 2>/dev/null | sed 's/.*= //') || continue
+      case "$cur" in
+        *mutter-x11-frames*) continue ;;
+        *${target_class}*) continue ;;
+      esac
+      if xdotool set_window --class "$target_class" --classname "$target_class" "$wid" 2>/dev/null; then
+        fix_count=$((fix_count + 1))
+      fi
+    done
+    log "fix_wm_class_persistent: Claude-$profile EVENT-FIX ($fix_count windows)"
+  fi
+
+  # PHASE 3 (A): 30s backup scan, raise/yeni-pencere/dialog koruma
+  local end_time=$(($(date +%s) + 30))
+  while [ $(date +%s) -lt $end_time ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    for wid in $(xdotool search --pid "$pid" 2>/dev/null); do
+      cur=$(xprop -id "$wid" WM_CLASS 2>/dev/null | sed 's/.*= //') || continue
+      case "$cur" in
+        *mutter-x11-frames*) continue ;;
+        *${target_class}*) continue ;;
+      esac
+      if xdotool set_window --class "$target_class" --classname "$target_class" "$wid" 2>/dev/null; then
+        fix_count=$((fix_count + 1))
+      fi
+    done
+    sleep 5
+  done
+  log "fix_wm_class_persistent: Claude-$profile done (total $fix_count fixes)"
+}
+
+# ============================================================
+# Orphan MCP/agent process sweep (PPID=1, claude-related)
+# ============================================================
+sweep_orphan_mcps() {
+  local count=0 pid ppid cmd
+  for pid in $(pgrep -f "$ORPHAN_PATTERNS" 2>/dev/null); do
+    ppid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null) || continue
+    if [ "$ppid" = "1" ]; then
+      kill -TERM "$pid" 2>/dev/null && count=$((count + 1))
+    fi
+  done
+  if [ $count -gt 0 ]; then
+    sleep 3
+    for pid in $(pgrep -f "$ORPHAN_PATTERNS" 2>/dev/null); do
+      ppid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null) || continue
+      [ "$ppid" = "1" ] && kill -KILL "$pid" 2>/dev/null
+    done
+    log "sweep_orphan_mcps: terminated $count orphan(s)"
+  fi
+  echo "$count"
+}
+
+# ============================================================
+# Per-profile cleanup (electron + helpers + orphan MCPs)
+# ============================================================
+cleanup_profile_children() {
+  local profile="$1"
+  local dir="$(profile_dir "$profile")"
+
+  if [ "$profile" = "1" ]; then
+    # Profile 1: electron + helpers + cowork (cmdline match)
+    pkill -TERM -f 'electron.*app\.asar' 2>/dev/null || true
+    sleep 3
+    pkill -KILL -f 'electron.*app\.asar' 2>/dev/null || true
+  else
+    # Profile 2/3/4/5: user-data-dir match
+    pkill -TERM -f "user-data-dir=$dir" 2>/dev/null || true
+    sleep 3
+    pkill -KILL -f "user-data-dir=$dir" 2>/dev/null || true
+  fi
+
+  # Orphan MCP sweep (electron oldukten sonra child'lar PPID=1'e reparent olur)
+  sleep 2
+  sweep_orphan_mcps >/dev/null
+
+  rm -f "$LAUNCH_CACHE/profile-$profile.pid"
+  log "cleanup_profile_children: Claude-$profile complete"
+}
+
+# ============================================================
+# Watcher singleton helper — yeni launch oncesi eski watcher'lari kill et
+# Mevcut sistem her launch'ta yeni watcher spawn ediyordu, eski'yi kapat-
+# miyordu. Hizli kapat-ac storm'unda profile basina 8+ paralel watcher
+# olusup CPU/log spam'i yaratiyordu. Bu fonksiyon tek-watcher invariant
+# saglayacak.
+# ============================================================
+kill_old_watchers() {
+  local profile="$1"
+  local pid_file="$LAUNCH_CACHE/profile-$profile.pid"
+  [ -f "$pid_file" ] || return 0
+  # PID file format: 2 satir
+  #   Line 1: electron PID
+  #   Line 2: watcher PID (subshell)
+  local watcher_pid
+  watcher_pid=$(sed -n '2p' "$pid_file" 2>/dev/null) || return 0
+  [ -z "$watcher_pid" ] && return 0
+  [[ "$watcher_pid" =~ ^[0-9]+$ ]] || return 0
+  if kill -0 "$watcher_pid" 2>/dev/null; then
+    log "kill_old_watchers: Profile $profile killing old watcher PID $watcher_pid"
+    kill "$watcher_pid" 2>/dev/null || true
+    sleep 0.5
+    kill -KILL "$watcher_pid" 2>/dev/null || true
+  fi
+}
+
+# ============================================================
+# Background watcher: PENCERE GIZLENDIGINDE cleanup
+# Onceki versiyon: kill -0 $pid (electron PID izle) — Claude Desktop X tiklayinca
+# pencereyi gizler ama process alive kalir → watcher tetiklenmez → MCP leak.
+# Yeni versiyon: wmctrl pencere varligini izle. Pencere yoksa kill electron + cleanup.
+# Bonus: raise_existing_profile sonrasi pencere geri gelirse skip etmiyoruz —
+# 5 ardisik scan'de pencere yoksa tetikleniyor (false positive korunmasi).
+# ============================================================
+supervise_profile() {
+  local profile="$1"
+  local electron_pid="$2"
+  local wm_class="Claude"
+  [ "$profile" != "1" ] && wm_class="Claude-$profile"
+
+  local missing_count=0
+  local check_interval=2
+  local missing_threshold=3  # 3 ardisik scan (6s) pencere yoksa cleanup
+
+  # 30s grace period: pencere ilk olusumu icin
+  sleep 30
+
+  while kill -0 "$electron_pid" 2>/dev/null; do
+    # Pencere wmctrl'de var mi?
+    local has_window=0
+    if [ "$profile" = "1" ]; then
+      # Profile 1: lowercase "claude" WM_CLASS
+      wmctrl -lx 2>/dev/null | awk '{print $3}' | grep -qiE "^claude\.Claude$" && has_window=1
+    else
+      wmctrl -lx 2>/dev/null | awk '{print $3}' | grep -q "^${wm_class}\.${wm_class}$" && has_window=1
+    fi
+
+    if [ $has_window -eq 1 ]; then
+      missing_count=0
+    else
+      missing_count=$((missing_count + 1))
+      if [ $missing_count -ge $missing_threshold ]; then
+        log "supervise_profile: Claude-$profile window gone (X clicked), cleanup tetiklendi"
+        break
+      fi
+    fi
+    sleep $check_interval
+  done
+
+  log "supervise_profile: Claude-$profile cleanup baslangic (electron $electron_pid hala alive=$(kill -0 $electron_pid 2>/dev/null && echo yes || echo no))"
+  cleanup_profile_children "$profile"
+}
+
+# ============================================================
+# Profile 1 (ana Claude) — direct launch (NO scope)
+# ============================================================
+launch_main() {
+  if profile_already_running 1; then
+    local pid
+    pid=$(pgrep -f 'electron.*app\.asar([[:space:]]|$)' 2>/dev/null \
+      | grep -v -- '--type=' | grep -v -- '--user-data-dir=' | head -1) || true
+    echo "Profile 1 zaten calisiyor (PID ${pid:-?}). Pencere raise..."
+    log "launch_main: Profile 1 already running, raising"
+    raise_existing_profile 1
+    return 0
+  fi
+
+  # Race protection: eski cleanup tamamlansin
+  wait_for_cleanup 1
+
+  # Watcher singleton: eski watcher varsa kill et (multi-watcher prevention)
+  kill_old_watchers 1
+
+  log "launch_main: launching Profile 1 (direct, no scope, extra_flags=${CLAUDE_EXTRA_FLAGS[*]:-none})"
+  # NOT: stdout/stderr LAUNCH_LOG'a YAZMIYORUZ — Electron renderer'i bozuyor
+  # (Dock-launched scenario'da siyah pencere). Sadece /dev/null'a.
+  nohup env COWORK_VM_BACKEND=bwrap TMPDIR="$MAIN_DIR/tmp" \
+    "$BIN" "${CLAUDE_EXTRA_FLAGS[@]}" >/dev/null 2>&1 &
+  disown
+  echo "Launched main Claude (Profile 1)"
+
+  # Electron PID yakala
+  local electron_pid="" tries=0
+  while [ $tries -lt 20 ]; do
+    electron_pid=$(pgrep -f 'electron.*app\.asar([[:space:]]|$)' 2>/dev/null \
+      | grep -v -- '--type=' | grep -v -- '--user-data-dir=' | head -1) || true
+    [ -n "${electron_pid:-}" ] && break
+    sleep 0.5
+    tries=$((tries + 1))
+  done
+
+  if [ -n "${electron_pid:-}" ]; then
+    log "launch_main: Profile 1 electron PID $electron_pid"
+    ( supervise_profile 1 "$electron_pid" ) >/dev/null 2>&1 &
+    local watcher_pid=$!
+    disown
+    # PID file format: line1=electron, line2=watcher (singleton tracking)
+    printf '%s\n%s\n' "$electron_pid" "$watcher_pid" > "$LAUNCH_CACHE/profile-1.pid"
+  else
+    log "launch_main: PID capture FAILED for Profile 1"
+  fi
+}
+
+# ============================================================
+# Profile 2/3/4/5 — direct launch (NO scope) + watcher
+# ============================================================
+launch_profile() {
+  local profile="$1"
+  local dir="$HOME/.config/Claude-$profile"
+
+  if profile_already_running "$profile"; then
+    local pid
+    pid=$(pgrep -f "electron.*--user-data-dir=$dir" 2>/dev/null | head -1) || true
+    echo "Profile $profile zaten calisiyor (PID ${pid:-?}). Pencere raise..."
+    log "launch_profile: Claude-$profile already running, raising"
+    raise_existing_profile "$profile"
+    return 0
+  fi
+
+  # Race protection: eski cleanup tamamlansin (kullanici X tikla + hemen tikla senaryosu)
+  wait_for_cleanup "$profile"
+
+  # Watcher singleton: eski watcher varsa kill et (multi-watcher prevention)
+  kill_old_watchers "$profile"
+
+  ensure_profile "$profile"
+  sync_token "$profile"
+
+  log "launch_profile: launching Claude-$profile (direct, no scope, extra_flags=${CLAUDE_EXTRA_FLAGS[*]:-none})"
+  # NOT: stdout/stderr LAUNCH_LOG'a YAZMIYORUZ — Electron renderer'i bozuyor
+  # (Dock-launched scenario'da siyah pencere). v1 davranisi: /dev/null'a yonlendir.
+  nohup env COWORK_VM_BACKEND=bwrap TMPDIR="$dir/tmp" \
+    "$BIN" --user-data-dir="$dir" --class="Claude-$profile" --name="Claude-$profile" \
+    "${CLAUDE_EXTRA_FLAGS[@]}" \
+    >/dev/null 2>&1 &
+  disown
+
+  # Electron PID yakala
+  local electron_pid="" tries=0
+  while [ $tries -lt 20 ]; do
+    electron_pid=$(pgrep -f "electron.*--user-data-dir=$dir" 2>/dev/null | head -1) || true
+    [ -n "${electron_pid:-}" ] && break
+    sleep 0.5
+    tries=$((tries + 1))
+  done
+
+  if [ -n "${electron_pid:-}" ]; then
+    log "launch_profile: Claude-$profile electron PID $electron_pid"
+    echo "Launched Claude Profile $profile (PID $electron_pid)"
+    # WM_CLASS fix arka planda
+    ( fix_wm_class_persistent "$profile" "$dir" ) >/dev/null 2>&1 &
+    disown
+    # Watcher
+    ( supervise_profile "$profile" "$electron_pid" ) >/dev/null 2>&1 &
+    local watcher_pid=$!
+    disown
+    # PID file format: line1=electron, line2=watcher (singleton tracking)
+    printf '%s\n%s\n' "$electron_pid" "$watcher_pid" > "$LAUNCH_CACHE/profile-$profile.pid"
+  else
+    echo "WARNING: Profile $profile electron PID could not be captured." >&2
+    log "launch_profile: PID capture FAILED for Claude-$profile"
+  fi
+}
+
+# ============================================================
+# Status (Profile 1 dahil dogru sayim)
+# ============================================================
+cmd_status() {
+  echo "=== Acik Claude Desktop instance'lari ==="
+  local found=0
+
+  # Profile 1
+  local p1_pid
+  p1_pid=$(pgrep -af 'electron.*app\.asar([[:space:]]|$)' 2>/dev/null \
+    | grep -v -- '--type=' \
+    | grep -v -- '--user-data-dir=' \
+    | awk '{print $1}' | head -1) || true
+  if [ -n "${p1_pid:-}" ]; then
+    local watcher="no-watcher"
+    [ -f "$LAUNCH_CACHE/profile-1.pid" ] && [ "$(sed -n '1p' $LAUNCH_CACHE/profile-1.pid)" = "$p1_pid" ] && watcher="watched"
+    printf "  PID %-8s — %s [%s]\n" "$p1_pid" "Profile 1 (ana)" "$watcher"
+    found=1
+  fi
+
+  # Profile 2/3/4/5
+  for profile in 2 3 4 5; do
+    local pid
+    pid=$(pgrep -f "electron.*--user-data-dir=$HOME/.config/Claude-$profile" 2>/dev/null | head -1) || true
+    if [ -n "${pid:-}" ]; then
+      local color
+      case "$profile" in
+        2) color="lavender" ;;
+        3) color="yesil" ;;
+        4) color="indigo-mor" ;;
+        5) color="test" ;;
+      esac
+      local watcher="no-watcher"
+      [ -f "$LAUNCH_CACHE/profile-$profile.pid" ] && [ "$(sed -n '1p' $LAUNCH_CACHE/profile-$profile.pid)" = "$pid" ] && watcher="watched"
+      printf "  PID %-8s — Profile %s (%s) [%s]\n" "$pid" "$profile" "$color" "$watcher"
+      found=1
+    fi
+  done
+
+  [ "$found" = "0" ] && echo "  (hicbiri acik degil)"
+
+  # Cowork
+  local cowork
+  cowork=$(pgrep -f cowork-vm-service.js 2>/dev/null | head -1) || true
+  echo ""
+  if [ -n "${cowork:-}" ]; then
+    echo "  Cowork-vm-service: PID $cowork"
+  else
+    echo "  Cowork-vm-service: (not running)"
+  fi
+
+  # Orphan check
+  local orphan_count=0
+  for pid in $(pgrep -f "$ORPHAN_PATTERNS" 2>/dev/null); do
+    local ppid
+    ppid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null) || continue
+    [ "$ppid" = "1" ] && orphan_count=$((orphan_count + 1))
+  done
+  if [ $orphan_count -gt 0 ]; then
+    echo "  WARNING: $orphan_count orphan MCP process detected (run: claude-launch sweep)"
+  fi
+}
+
+# ============================================================
+# Kill profile (cleanup_profile_children kullanir)
+# ============================================================
+kill_profile() {
+  local profile="$1"
+  log "kill_profile: terminating Profile $profile"
+  cleanup_profile_children "$profile"
+  echo "Profile $profile terminated."
+}
+
+# ============================================================
+# Sweep komutu
+# ============================================================
+cmd_sweep() {
+  echo "=== Orphan MCP/agent process sweep ==="
+  local count
+  count=$(sweep_orphan_mcps)
+  if [ "$count" -gt 0 ]; then
+    echo "Cleaned $count orphan process(es)."
+  else
+    echo "  (no orphans)"
+  fi
+}
+
+# ============================================================
+# Dispatch
+# ============================================================
+case "${1:-}" in
+  ""|1)
+    launch_main
+    ;;
+  2|3|4|5)
+    launch_profile "$1"
+    ;;
+  all)
+    launch_main; sleep 1
+    launch_profile 2; sleep 1
+    launch_profile 3; sleep 1
+    launch_profile 4
+    ;;
+  status)
+    cmd_status
+    ;;
+  kill)
+    profile="${2:?Usage: claude-launch kill <1|2|3|4|5>}"
+    kill_profile "$profile"
+    ;;
+  kill-extras)
+    for p in 2 3 4 5; do
+      kill_profile "$p" 2>/dev/null || true
+    done
+    echo "Done. Main Claude (Profile 1) untouched."
+    ;;
+  kill-all)
+    for p in 2 3 4 5 1; do
+      kill_profile "$p" 2>/dev/null || true
+    done
+    echo "Done. ALL Claude profiles terminated."
+    ;;
+  sweep)
+    cmd_sweep
+    ;;
+  -h|--help|help)
+    sed -n '2,21p' "$0"
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    echo "Run: claude-launch --help" >&2
+    exit 1
+    ;;
+esac
