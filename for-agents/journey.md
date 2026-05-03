@@ -342,10 +342,10 @@ User: "Push this to GitHub. Name it `multi session claude desktop`."
 
 Realized: Future maintainers (human or AI) will face the same dead-ends without this knowledge. Created:
 - `CLAUDE.md` — orientation + critical constraints
-- `docs/ARCHITECTURE.md` — technical deep dive
-- `docs/lessons/errors.md` — every error we hit + fix
-- `docs/lessons/golden-paths.md` — proven workflows
-- `docs/lessons/anti-patterns.md` — what NOT to try
+- `for-agents/ARCHITECTURE.md` — technical deep dive
+- `for-agents/lessons/errors.md` — every error we hit + fix
+- `for-agents/lessons/golden-paths.md` — proven workflows
+- `for-agents/lessons/anti-patterns.md` — what NOT to try
 - `docs/journey.md` — this file (the story)
 
 The pattern: error catalog + golden paths + anti-patterns + journey is from observability practice (post-mortem culture). Heavily inspired by SRE workbook patterns.

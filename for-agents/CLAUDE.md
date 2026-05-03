@@ -1,6 +1,6 @@
 # CLAUDE.md — multi-instance-claude-desktop Project Context
 
-> **For AI agents working on this codebase**: Read this file FIRST. Then read `docs/ARCHITECTURE.md` and `docs/lessons/anti-patterns.md` BEFORE making any changes. This project went through 30+ iterations and we know which approaches break things.
+> **For AI agents working on this codebase**: Read this file FIRST. Then read `for-agents/ARCHITECTURE.md` and `for-agents/lessons/anti-patterns.md` BEFORE making any changes. This project went through 30+ iterations and we know which approaches break things.
 
 ## What This Project Solves
 
@@ -67,11 +67,11 @@ When user clicks dock icon for an already-running profile: spawn a SECOND Electr
 
 ## When You Edit This Project
 
-1. Read `docs/lessons/anti-patterns.md` to know what's been tried and broken
-2. Read `docs/ARCHITECTURE.md` for the WHY behind the WHAT
-3. Test each change against `docs/lessons/golden-paths.md` test scenarios
-4. If you add a new behavior, document it in `docs/lessons/golden-paths.md`
-5. If you hit a new error, add it to `docs/lessons/errors.md`
+1. Read `for-agents/lessons/anti-patterns.md` to know what's been tried and broken
+2. Read `for-agents/ARCHITECTURE.md` for the WHY behind the WHAT
+3. Test each change against `for-agents/lessons/golden-paths.md` test scenarios
+4. If you add a new behavior, document it in `for-agents/lessons/golden-paths.md`
+5. If you hit a new error, add it to `for-agents/lessons/errors.md`
 6. NEVER claim success without:
    - `bash -n bin/claude-launch` (syntax)
    - Live test: kill profile + relaunch + measure glitch + check cleanup

@@ -2,6 +2,9 @@
 
 Run **multiple Claude Desktop profiles** in parallel on Linux (Fedora/Debian/Ubuntu) with:
 
+> **For AI agents working on this codebase**: Read [`for-agents/CLAUDE.md`](for-agents/CLAUDE.md) FIRST. Then `for-agents/lessons/anti-patterns.md` and `for-agents/ARCHITECTURE.md` BEFORE making changes.
+
+
 - **Per-profile isolation** (separate login, settings, cookies)
 - **Shared chat history & sessions** (single source of truth via symlinks)
 - **Window-close → MCP cleanup** (X button kills all MCP children, no leak)

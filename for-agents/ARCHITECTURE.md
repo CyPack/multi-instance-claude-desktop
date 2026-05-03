@@ -127,7 +127,7 @@ This scope is created BY GNOME automatically. Each Electron's children (renderer
 We tried it (v2 of claude-launch). Result: black screen on launch.
 Root cause: `systemd-run --scope` modifies the process environment in subtle ways (different stdin handling, different inherited descriptors, different XDG bindings). Electron's renderer process detected this and failed to initialize the GPU compositor. Window opened with title bar but no content.
 
-**Lesson**: Trust GNOME's auto-scope. Don't add nested scopes. See `docs/lessons/anti-patterns.md` §1.
+**Lesson**: Trust GNOME's auto-scope. Don't add nested scopes. See `for-agents/lessons/anti-patterns.md` §1.
 
 ---
 

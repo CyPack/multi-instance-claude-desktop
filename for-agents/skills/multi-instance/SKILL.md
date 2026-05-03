@@ -242,20 +242,20 @@ Black window on launch
 
 ## After Each Successful Use of This Skill
 
-If you encountered a NEW error → add to `docs/lessons/errors.md`
-If you discovered a NEW workflow → add to `docs/lessons/golden-paths.md`
-If you tried something that BROKE → add to `docs/lessons/anti-patterns.md`
+If you encountered a NEW error → add to `for-agents/lessons/errors.md`
+If you discovered a NEW workflow → add to `for-agents/lessons/golden-paths.md`
+If you tried something that BROKE → add to `for-agents/lessons/anti-patterns.md`
 Increment `lesson_count` in this SKILL.md frontmatter.
 
 ## Reference Files
 
 - `bin/claude-launch` — the script (single source of truth)
 - `desktop-entries/claude-desktop-{2,3,4}.desktop` — launcher entries
-- `docs/ARCHITECTURE.md` — deep dive
-- `docs/lessons/errors.md` — error catalog
-- `docs/lessons/golden-paths.md` — proven workflows
-- `docs/lessons/anti-patterns.md` — what NOT to try
-- `docs/journey.md` — chronological project history
+- `for-agents/ARCHITECTURE.md` — deep dive
+- `for-agents/lessons/errors.md` — error catalog
+- `for-agents/lessons/golden-paths.md` — proven workflows
+- `for-agents/lessons/anti-patterns.md` — what NOT to try
+- `for-agents/journey.md` — chronological project history
 
 ## External References
 
